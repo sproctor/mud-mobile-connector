@@ -27,8 +27,6 @@ locally and MUD Mobile only ever receives `sha256(key)`.
    ready runner.
 8. Optionally, the session is ended (`DELETE /api/sessions/{id}`) when the front end exits.
 
-See `../mudmobile/docs/warlock-integration.md` for the full API contract this implements.
-
 ## Build & run
 
 ```sh
@@ -70,23 +68,8 @@ a `protocol` (`storm`/`wiz`).
 `frontends.rs` registry + spawn · `config.rs`/`keychain.rs` persistence · `worker.rs`
 background thread · `app.rs` egui UI/state machine · `model.rs`/`error.rs` shared types.
 
-## Manual end-to-end test
-
-Unit/integration tests cover the protocol logic offline. To validate against the live
-service you need a real play.net account and a `wlk_` token. The MUD Mobile spike is the
-oracle:
-
-```sh
-SIMU_ACCOUNT=… SIMU_PASSWORD=… SIMU_CHARACTER=… WLK_TOKEN=wlk_… \
-  node ../mudmobile/spike/hostedsal.mjs --game DR --out /tmp/ref.sal
-```
-
-Then run this app, launch the same character, and compare the generated `.sal` (its path is
-shown on the Launched screen) against `/tmp/ref.sal` — `GAMEHOST`/`GAMEPORT` should point at
-the router and `KEY` should match.
-
 ## Status / follow-ups
 
-- Plaintext-only connection model (per design choice); TLS-proxy mode not yet implemented.
+- Plaintext-only connection model; TLS-proxy mode not yet implemented.
 - SGE socket uses a single read per response (like Lich's `sysread`); add grace-period
   coalescing if a response ever arrives split across TCP segments.

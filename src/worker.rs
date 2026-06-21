@@ -22,6 +22,8 @@ use crate::{keychain, sal, sge};
 const ROUTER_PLAINTEXT_PORT: u16 = 7000;
 
 /// Work requested by the UI. `base` is the optional API base override (else mudmobile.com).
+/// `Clone` so the UI can stash a copy to re-issue (e.g. an unverified-TLS retry).
+#[derive(Clone)]
 pub enum Command {
     /// Validate a token and load the character list in one shot.
     LoadCharacters { base: Option<String>, token: String },
@@ -36,6 +38,8 @@ pub enum Command {
         save: bool,
         /// Whether to persist the password to the keychain on success.
         remember: bool,
+        /// Whether to use TLS (always cert-pinned) for the eaccess login, vs plaintext.
+        use_tls: bool,
     },
     /// Full launch: SGE login -> create session -> write .sal -> spawn the front end.
     Launch {
@@ -45,9 +49,10 @@ pub enum Command {
         /// Explicit password, or None to use the stored one (asking the UI if there isn't one).
         password: Option<String>,
         frontend: FrontEnd,
-        delete_session_on_exit: bool,
         /// Whether to persist the password to the keychain on success.
         remember: bool,
+        /// Whether to use TLS (always cert-pinned) for the eaccess login, vs plaintext.
+        use_tls: bool,
     },
 }
 
@@ -73,6 +78,8 @@ pub enum Event {
     NeedPassword,
     /// SGE rejected the password; the stored one (if any) was cleared. Prompt to re-enter.
     SgeAuthFailed { account: String, message: String },
+    /// The verified TLS connection to eaccess failed. The UI offers to retry unverified.
+    TlsRetryOffer { message: String },
     /// An operation failed (message is the user-facing AppError text).
     Failed { message: String, token_invalid: bool },
 }
@@ -114,25 +121,20 @@ fn handle(cmd: Command, tx: &Sender<Event>, ctx: &egui::Context) {
             game,
             save,
             remember,
-        } => discover(base, token, account, password, game, save, remember, tx, ctx),
+            use_tls,
+        } => discover(
+            base, token, account, password, game, save, remember, use_tls, tx, ctx,
+        ),
         Command::Launch {
             base,
             token,
             character,
             password,
             frontend,
-            delete_session_on_exit,
             remember,
+            use_tls,
         } => launch(
-            base,
-            token,
-            character,
-            password,
-            frontend,
-            delete_session_on_exit,
-            remember,
-            tx,
-            ctx,
+            base, token, character, password, frontend, remember, use_tls, tx, ctx,
         ),
     };
     if let Err(e) = result {
@@ -161,6 +163,7 @@ fn load_characters(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover(
     base: Option<String>,
     token: String,
@@ -169,11 +172,19 @@ fn discover(
     game: String,
     save: bool,
     remember: bool,
+    use_tls: bool,
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> Result<(), AppError> {
     stage(tx, ctx, "Logging in to discover characters…");
-    let chars = sge::discover_characters(&account, &password, &game)?;
+    let chars = match sge::discover_characters(&account, &password, &game, use_tls) {
+        Ok(c) => c,
+        Err(AppError::SgeTls(message)) => {
+            emit(tx, ctx, Event::TlsRetryOffer { message });
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     // The password worked — remember it if the user opted in.
     if remember {
         let _ = keychain::set_password(&account, &password);
@@ -201,8 +212,8 @@ fn launch(
     character: Character,
     password: Option<String>,
     frontend: FrontEnd,
-    delete_session_on_exit: bool,
     remember: bool,
+    use_tls: bool,
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> Result<(), AppError> {
@@ -222,6 +233,7 @@ fn launch(
         &password,
         &character.game,
         &character.character_code,
+        use_tls,
     ) {
         Ok(r) => r,
         Err(AppError::SgeAuth(message)) => {
@@ -235,6 +247,10 @@ fn launch(
                     message,
                 },
             );
+            return Ok(());
+        }
+        Err(AppError::SgeTls(message)) => {
+            emit(tx, ctx, Event::TlsRetryOffer { message });
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -270,14 +286,11 @@ fn launch(
     );
     let sal_path = sal::write_temp_sal(&sal_text)?;
 
-    // 5. Spawn the front end.
+    // 5. Spawn the front end and forget it: the launcher is fire-and-forget, and the
+    //    hosted runner stays up idle after the front end exits — MUD Mobile auto-routes
+    //    the next connection back to that same idle runner.
     stage(tx, ctx, &format!("Launching {}…", frontend.name));
-    let child = frontends::spawn(&frontend, &sal_path)?;
-
-    // 6. Optionally free the session slot when the front end exits.
-    if delete_session_on_exit {
-        spawn_exit_watcher(base, token, session.session_id.clone(), child);
-    }
+    frontends::spawn(&frontend, &sal_path)?;
 
     emit(
         tx,
@@ -351,22 +364,4 @@ fn wait_for_runner(
         }
         thread::sleep(RUNNER_POLL_INTERVAL);
     }
-}
-
-/// Wait for the front-end process to exit, then `DELETE /api/sessions/{id}`.
-fn spawn_exit_watcher(
-    base: Option<String>,
-    token: String,
-    session_id: String,
-    mut child: std::process::Child,
-) {
-    thread::Builder::new()
-        .name("mm-fe-watch".into())
-        .spawn(move || {
-            let _ = child.wait();
-            if let Ok(api) = Api::new(base.as_deref(), &token) {
-                let _ = api.delete_session(&session_id);
-            }
-        })
-        .ok();
 }

@@ -34,6 +34,11 @@ pub enum AppError {
     #[error("SGE login failed: {0}")]
     SgeAuth(String),
 
+    /// The verified (cert-pinned) TLS connection to eaccess failed — the handshake broke
+    /// or the certificate didn't match the pin. The UI offers to retry unverified.
+    #[error("SGE TLS connection failed: {0}")]
+    SgeTls(String),
+
     /// The selected character wasn't in the EAccess character list.
     #[error("Character {0:?} was not found on this account.")]
     CharacterNotFound(String),

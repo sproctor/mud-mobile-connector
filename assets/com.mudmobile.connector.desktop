@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MUD Mobile Connector
+Comment=Launch Simutronics front ends through MUD Mobile
+Exec=mudmobile-connector
+Icon=com.mudmobile.connector
+Terminal=false
+Categories=Game;Network;
+# Must match the Wayland app id / X11 WM class set in main.rs so the compositor
+# associates the running window with this entry (and thus this icon).
+StartupWMClass=com.mudmobile.connector

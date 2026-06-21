@@ -1,0 +1,46 @@
+[package]
+name = "mudmobile-connector"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform front-end launcher for MUDmobile (Simutronics SGE -> hosted Lich)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+# HTTP client (blocking). native-tls => OS-native TLS (OpenSSL on Linux, SChannel/SecureTransport
+# on Windows/macOS); no bundled crypto, so the smallest binary and no cmake needed to build.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
+native-tls = "0.2"
+directories = "5"
+# OS keychain for the wlk_ device token. Pure-Rust backends (no OpenSSL/cmake):
+# Secret Service on Linux (crypto-rust), Keychain on macOS, Credential Manager on Windows.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+tempfile = "3"
+thiserror = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+# Native GUI. glow (OpenGL) backend; drop accesskit to keep the binary small.
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+# Native file-picker for setting front-end executable paths (xdg-portal on Linux: no GTK link).
+rfd = "0.15"
+# eframe pulls winit with default-features off and omits adwaita decorations, so on
+# GNOME/Wayland the window gets bare, square client-side decorations. Re-enable the
+# adwaita CSD feature (cargo unifies it into eframe's winit) for native-looking titlebars.
+winit = { version = "0.30", features = ["wayland-csd-adwaita"] }
+
+[dev-dependencies]
+# Tiny stub HTTP server for API client tests (no network).
+tiny_http = "0.12"
+
+# Size-optimized release binary (download size is a priority).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -16,8 +16,10 @@ hex = "0.4"
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"] }
 native-tls = "0.2"
 directories = "5"
-# OS keychain for the wlk_ device token. Pure-Rust backends (no OpenSSL/cmake):
-# Secret Service on Linux (crypto-rust), Keychain on macOS, Credential Manager on Windows.
+# OS keychain for the wlk_ device token: Secret Service on Linux, Keychain on macOS,
+# Credential Manager on Windows. `sync-secret-service` (the blocking backend) links libdbus,
+# so Linux builds need the dbus-1 dev headers (installed in CI; present on any desktop with a
+# Secret Service). `crypto-rust` avoids an OpenSSL dependency for the session encryption.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 tempfile = "3"
 thiserror = "1"

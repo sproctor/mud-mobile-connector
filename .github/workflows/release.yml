@@ -31,14 +31,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # native-tls links OpenSSL on Linux; eframe/winit need xcb + xkbcommon.
-      # (Windows/macOS use the OS-native TLS stack, so no extra deps there.)
+      # native-tls links OpenSSL; eframe/winit need xcb + xkbcommon; the keyring crate's
+      # sync-secret-service backend links libdbus. (Windows/macOS use OS-native libraries.)
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev \
+            pkg-config libssl-dev libdbus-1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev
 

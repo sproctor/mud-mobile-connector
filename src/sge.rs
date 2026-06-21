@@ -10,13 +10,11 @@
 //! `K` (hash key) -> hash password -> `A` (auth) -> `M` -> `F`/`G`/`P` (game info)
 //! -> `C` (character list) -> `L <code> STORM` (launch tokens).
 
-use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use native_tls::TlsStream;
+use native_tls::{Certificate, TlsStream};
 
 use crate::error::{AppError, AppResult};
 use crate::model::{SgeChar, SgeResult};
@@ -112,65 +110,122 @@ fn result_from_tokens(tokens: Vec<(String, String)>) -> AppResult<SgeResult> {
 }
 
 // ---------------------------------------------------------------------------
-// Connection + TOFU cert pinning
+// Connection + certificate verification
 // ---------------------------------------------------------------------------
 
-/// Where we store the trust-on-first-use copy of the eaccess cert.
-fn pinned_cert_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("com", "mudmobile", "connector")
-        .map(|d| d.data_dir().join("eaccess-cert.der"))
+/// The eaccess.play.net leaf certificate (self-signed by Simutronics Corp.), bundled
+/// from the Warlock source. Today's cert chains to no public CA, so it can't be verified
+/// the normal way — we accept it by pinning (the server presents exactly this certificate).
+/// We *also* accept any cert that validates against a public CA for eaccess.play.net, so the
+/// login keeps working if Simutronics ever moves to a normally-trusted certificate.
+const SIMU_PEM: &[u8] = include_bytes!("../assets/simu.pem");
+
+/// The SGE socket: either a verified TLS stream or a raw plaintext TCP stream when the user
+/// has turned TLS off. Both halves implement `Read`/`Write`; we dispatch at runtime so the
+/// rest of the protocol code is stream-agnostic.
+enum SgeStream {
+    Tls(Box<TlsStream<TcpStream>>),
+    Plain(TcpStream),
 }
 
-/// Trust-on-first-use pin check, mirroring Lich's `verify_pem`: store the cert on
-/// first connect, warn + update (never hard-fail) if it changes later.
-fn tofu_check(stream: &TlsStream<TcpStream>) {
-    let Ok(Some(cert)) = stream.peer_certificate() else {
-        return;
-    };
-    let Ok(der) = cert.to_der() else { return };
-    let Some(path) = pinned_cert_path() else { return };
-    if path.exists() {
-        match fs::read(&path) {
-            Ok(stored) if stored == der => {}
-            Ok(_) => {
-                log::warn!("eaccess.play.net certificate changed since last connect; updating pin");
-                let _ = fs::write(&path, &der);
-            }
-            Err(_) => {
-                let _ = fs::write(&path, &der);
-            }
+impl Read for SgeStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SgeStream::Tls(s) => s.read(buf),
+            SgeStream::Plain(s) => s.read(buf),
         }
-    } else {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&path, &der);
     }
 }
 
-/// Open a TLS connection to eaccess. The cert is self-signed (hence the danger
-/// flags); we pin it TOFU instead.
-fn connect() -> AppResult<TlsStream<TcpStream>> {
+impl Write for SgeStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SgeStream::Tls(s) => s.write(buf),
+            SgeStream::Plain(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SgeStream::Tls(s) => s.flush(),
+            SgeStream::Plain(s) => s.flush(),
+        }
+    }
+}
+
+/// Open the eaccess socket. When `use_tls` is off it's a plaintext socket. When on, the cert
+/// is accepted if it's *either* our bundled `simu.pem` (pin) *or* valid for a public CA — so
+/// a future move by Simutronics to a normally-trusted certificate won't break us, while an
+/// attacker's cert (neither pinned nor CA-valid for eaccess.play.net) is still refused before
+/// any password is sent. There is no encrypted-but-unverified mode.
+fn connect(use_tls: bool) -> AppResult<SgeStream> {
     let addr = (HOST, PORT)
         .to_socket_addrs()
         .map_err(|e| AppError::Network(format!("resolving {HOST}: {e}")))?
         .next()
         .ok_or_else(|| AppError::Network(format!("no address for {HOST}")))?;
-    let tcp = TcpStream::connect_timeout(&addr, IO_TIMEOUT)
-        .map_err(|e| AppError::Network(format!("connecting to eaccess: {e}")))?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
-    let connector = native_tls::TlsConnector::builder()
+    if !use_tls {
+        // TLS disabled by the user: raw, unencrypted socket (no cert involved).
+        return Ok(SgeStream::Plain(tcp_connect(&addr)?));
+    }
+
+    // 1. Accept-any handshake so we can inspect the cert, then check it against our pin.
+    //    This is the common case today (Simu's self-signed cert) and needs one handshake.
+    let permissive = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
         .build()
         .map_err(|e| AppError::Network(format!("building TLS connector: {e}")))?;
-    let stream = connector
-        .connect(HOST, tcp)
-        .map_err(|e| AppError::Network(format!("TLS handshake to eaccess failed: {e}")))?;
-    tofu_check(&stream);
-    Ok(stream)
+    let stream = permissive
+        .connect(HOST, tcp_connect(&addr)?)
+        .map_err(|e| AppError::SgeTls(format!("TLS handshake to eaccess failed: {e}")))?;
+    if cert_matches_pin(&stream)? {
+        return Ok(SgeStream::Tls(Box::new(stream)));
+    }
+
+    // 2. Not our bundled cert. Maybe Simutronics moved to a publicly-trusted CA — re-handshake
+    //    with full verification (system roots + hostname). Succeeds only for a genuinely valid
+    //    eaccess.play.net cert; otherwise the connection is refused.
+    drop(stream);
+    let strict = native_tls::TlsConnector::builder()
+        .build()
+        .map_err(|e| AppError::Network(format!("building TLS connector: {e}")))?;
+    let stream = strict.connect(HOST, tcp_connect(&addr)?).map_err(|e| {
+        AppError::SgeTls(format!(
+            "eaccess.play.net presented a certificate that is neither the bundled Simutronics \
+             certificate nor valid for a public CA ({e}). If Simutronics rotated their cert, \
+             update assets/simu.pem; otherwise this may be interception."
+        ))
+    })?;
+    Ok(SgeStream::Tls(Box::new(stream)))
+}
+
+/// Connect a TCP socket to eaccess with the standard I/O timeouts.
+fn tcp_connect(addr: &SocketAddr) -> AppResult<TcpStream> {
+    let tcp = TcpStream::connect_timeout(addr, IO_TIMEOUT)
+        .map_err(|e| AppError::Network(format!("connecting to eaccess: {e}")))?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
+    tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
+    Ok(tcp)
+}
+
+/// Does the peer's certificate exactly match the bundled `simu.pem`? (Lich's `verify_pem` /
+/// Warlock's trust manager.) Errors only if the cert can't be read; a non-match returns `false`
+/// so the caller can fall back to public-CA verification.
+fn cert_matches_pin(stream: &TlsStream<TcpStream>) -> AppResult<bool> {
+    let expected = Certificate::from_pem(SIMU_PEM)
+        .and_then(|c| c.to_der())
+        .map_err(|e| AppError::Network(format!("loading bundled eaccess cert: {e}")))?;
+    let Some(peer) = stream
+        .peer_certificate()
+        .map_err(|e| AppError::SgeTls(format!("reading eaccess cert: {e}")))?
+    else {
+        return Ok(false);
+    };
+    let peer_der = peer
+        .to_der()
+        .map_err(|e| AppError::SgeTls(format!("encoding eaccess cert: {e}")))?;
+    Ok(peer_der == expected)
 }
 
 /// Thin protocol wrapper over a stream (a TLS socket in production, a scripted mock
@@ -179,10 +234,10 @@ struct Sge<S> {
     stream: S,
 }
 
-impl Sge<TlsStream<TcpStream>> {
-    /// Open a TLS connection to eaccess.
-    fn open() -> AppResult<Self> {
-        Ok(Sge { stream: connect()? })
+impl Sge<SgeStream> {
+    /// Open the eaccess socket — pinned TLS, or plaintext when `use_tls` is false.
+    fn open(use_tls: bool) -> AppResult<Self> {
+        Ok(Sge { stream: connect(use_tls)? })
     }
 }
 
@@ -290,15 +345,26 @@ impl<S: Read + Write> Sge<S> {
 
 /// Log in and return the account's character list (for the "new connection" /
 /// discovery flow). Does not launch.
-pub fn discover_characters(account: &str, password: &str, game_code: &str) -> AppResult<Vec<SgeChar>> {
-    let mut sge = Sge::open()?;
+pub fn discover_characters(
+    account: &str,
+    password: &str,
+    game_code: &str,
+    use_tls: bool,
+) -> AppResult<Vec<SgeChar>> {
+    let mut sge = Sge::open(use_tls)?;
     sge.authenticate(account, password, game_code)
 }
 
 /// Full login for a known character code: authenticate, then `L ... STORM`.
 /// Returns the launch tokens (incl. the real key) for building the `.sal`.
-pub fn launch(account: &str, password: &str, game_code: &str, char_code: &str) -> AppResult<SgeResult> {
-    let mut sge = Sge::open()?;
+pub fn launch(
+    account: &str,
+    password: &str,
+    game_code: &str,
+    char_code: &str,
+    use_tls: bool,
+) -> AppResult<SgeResult> {
+    let mut sge = Sge::open(use_tls)?;
     let chars = sge.authenticate(account, password, game_code)?;
     if !chars.is_empty() && !chars.iter().any(|c| c.code == char_code) {
         return Err(AppError::CharacterNotFound(format!(
@@ -316,6 +382,15 @@ pub fn launch(account: &str, password: &str, game_code: &str, char_code: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_eaccess_cert_parses() {
+        // Guards against a missing/corrupt assets/simu.pem: pin_check loads it the same way.
+        let der = Certificate::from_pem(SIMU_PEM)
+            .and_then(|c| c.to_der())
+            .expect("bundled simu.pem is a valid certificate");
+        assert!(!der.is_empty());
+    }
 
     #[test]
     fn hash_password_known_vector() {

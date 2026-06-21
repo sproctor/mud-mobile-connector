@@ -25,7 +25,9 @@ locally and MUD Mobile only ever receives `sha256(key)`.
 7. A `.sal` is written locally (real `KEY` kept; `GAMEHOST`/`GAMEPORT` rewritten to the
    router on the **plaintext port 7000**) and the chosen front end is launched against the
    ready runner.
-8. Optionally, the session is ended (`DELETE /api/sessions/{id}`) when the front end exits.
+8. The launcher is fire-and-forget: after spawning the front end it exits the launch flow.
+   The hosted runner stays up idle, and MUD Mobile auto-routes the next connection back to
+   that same idle runner (no client-side session teardown).
 
 ## Build & run
 
@@ -56,8 +58,13 @@ a `protocol` (`storm`/`wiz`).
 
 - **Stack:** Rust + egui/eframe (native GUI, no webview/JRE → small self-contained binary).
 - **Networking:** blocking `ureq` (HTTPS) + `native-tls` for both HTTPS and the SGE socket
-  (single TLS stack, OS-native, no bundled crypto). The eaccess cert is self-signed, so it's
-  accepted and **trust-on-first-use pinned** (stored under the data dir), mirroring Lich.
+  (single TLS stack, OS-native, no bundled crypto). SGE uses TLS by default. The certificate is
+  accepted if it's **either** the bundled `assets/simu.pem` (the Warlock-sourced self-signed
+  Simutronics cert, matched by pinning) **or** valid for a public CA — so the login keeps working
+  if Simutronics ever moves to a normally-trusted certificate, while anything else aborts before a
+  password is sent (there is no encrypted-but-unverified mode). TLS can be turned off entirely in
+  Settings (plaintext socket, e.g. for a test server), and a failed TLS connection offers a
+  one-off **retry over plaintext**.
 - **Concurrency:** all blocking work runs on one worker thread (`worker.rs`); the egui UI
   only drains events and renders. The worker calls `request_repaint()` to wake the UI.
 - **Connection model:** plaintext-direct (the front end connects straight to the router on

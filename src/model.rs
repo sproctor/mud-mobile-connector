@@ -193,11 +193,15 @@ pub struct Config {
     pub last_used_character_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_frontend: Option<String>,
-    #[serde(default = "default_true")]
-    pub delete_session_on_exit: bool,
     /// Save play.net passwords to the OS keychain and reuse them.
     #[serde(default = "default_true")]
     pub remember_password: bool,
+    /// Use TLS for the eaccess/SGE login. When on, the connection is encrypted and the cert must
+    /// be either the bundled Simutronics certificate (pinned) or valid for a public CA. When off,
+    /// it's a plaintext socket (e.g. for a test server that doesn't speak TLS). There is no
+    /// encrypted-but-unverified mode.
+    #[serde(default = "default_true")]
+    pub use_tls: bool,
     /// Override the API base URL (for testing/staging). Defaults to https://mudmobile.com.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
@@ -211,8 +215,8 @@ impl Default for Config {
             frontends: crate::frontends::default_frontends(),
             last_used_character_id: None,
             last_used_frontend: None,
-            delete_session_on_exit: true,
             remember_password: true,
+            use_tls: true,
             api_base: None,
         }
     }

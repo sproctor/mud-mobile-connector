@@ -80,6 +80,8 @@ enum Screen {
     Busy,
     Launched,
     Settings,
+    /// A pinned-TLS connection to eaccess failed; offer to retry unverified.
+    TlsRetry,
 }
 
 pub struct App {
@@ -93,6 +95,11 @@ pub struct App {
     busy_return: Screen,
     /// Character we're trying to launch (drives the password screen + relaunch).
     launch_target: Option<Character>,
+    /// The last SGE-bearing command (Discover/Launch), kept so a TLS failure can be
+    /// re-issued over a plaintext connection (TLS off).
+    last_sge_cmd: Option<Command>,
+    /// Message for the TLS-retry prompt (Some => the `TlsRetry` screen is showing it).
+    tls_retry_message: Option<String>,
 
     // form fields
     token_input: String,
@@ -135,6 +142,8 @@ impl App {
             },
             busy_return: Screen::Characters,
             launch_target: None,
+            last_sge_cmd: None,
+            tls_retry_message: None,
             token_input: String::new(),
             account_input: String::new(),
             password_input: String::new(),
@@ -189,15 +198,17 @@ impl App {
         self.stage = "Starting…".into();
         self.busy_return = Screen::Characters;
         self.screen = Screen::Busy;
-        let _ = self.cmd_tx.send(Command::Launch {
+        let cmd = Command::Launch {
             base: self.base(),
             token: self.token(),
             character,
             password,
             frontend,
-            delete_session_on_exit: self.config.delete_session_on_exit,
             remember: self.config.remember_password,
-        });
+            use_tls: self.config.use_tls,
+        };
+        self.last_sge_cmd = Some(cmd.clone());
+        let _ = self.cmd_tx.send(cmd);
     }
 
     // ---- event handling ---------------------------------------------------
@@ -240,6 +251,11 @@ impl App {
                     self.error =
                         Some(format!("Password for {account} failed: {message} — re-enter it."));
                     self.screen = Screen::Password;
+                }
+                Event::TlsRetryOffer { message } => {
+                    self.error = None;
+                    self.tls_retry_message = Some(message);
+                    self.screen = Screen::TlsRetry;
                 }
                 Event::Failed {
                     message,
@@ -410,7 +426,7 @@ impl App {
                 self.stage = "Discovering…".into();
                 self.busy_return = Screen::NewConnection;
                 self.screen = Screen::Busy;
-                let _ = self.cmd_tx.send(Command::Discover {
+                let cmd = Command::Discover {
                     base: self.base(),
                     token: self.token(),
                     account: self.account_input.trim().to_string(),
@@ -418,7 +434,10 @@ impl App {
                     game: self.game_input.trim().to_string(),
                     save: self.save_discovered,
                     remember: self.config.remember_password,
-                });
+                    use_tls: self.config.use_tls,
+                };
+                self.last_sge_cmd = Some(cmd.clone());
+                let _ = self.cmd_tx.send(cmd);
             }
             if ui.button("Cancel").clicked() {
                 self.password_input.clear();
@@ -527,6 +546,56 @@ impl App {
         });
     }
 
+    fn ui_tls_retry(&mut self, ui: &mut egui::Ui) {
+        title(ui, "Secure connection failed");
+        let msg = self.tls_retry_message.clone().unwrap_or_default();
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("⚠ {msg}"))
+                    .color(egui::Color32::from_rgb(220, 80, 80)),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        ui.add(egui::Label::new(
+            "You can retry over a plaintext (unencrypted) connection — the password and key would \
+             travel in the clear, so only do this on a network you trust, or for a test server \
+             that doesn't speak TLS.",
+        )
+        .wrap());
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("Retry over plaintext").clicked() {
+                self.retry_sge_plaintext();
+            }
+            if ui.button("Cancel").clicked() {
+                self.tls_retry_message = None;
+                self.last_sge_cmd = None;
+                self.screen = self.busy_return;
+            }
+        });
+    }
+
+    /// Re-issue the last SGE command (Discover/Launch) with TLS turned off — the
+    /// "Retry over plaintext" action after a TLS connection failure.
+    fn retry_sge_plaintext(&mut self) {
+        self.tls_retry_message = None;
+        let Some(mut cmd) = self.last_sge_cmd.clone() else {
+            self.screen = self.busy_return;
+            return;
+        };
+        match &mut cmd {
+            Command::Discover { use_tls, .. } | Command::Launch { use_tls, .. } => {
+                *use_tls = false;
+            }
+            _ => {}
+        }
+        self.last_sge_cmd = Some(cmd.clone());
+        self.stage = "Retrying over a plaintext connection…".into();
+        self.screen = Screen::Busy;
+        let _ = self.cmd_tx.send(cmd);
+    }
+
     fn ui_launched(&mut self, ui: &mut egui::Ui) {
         title(ui, "Launched ✓");
         if let Some((session_id, sal_path, fe)) = &self.launched {
@@ -577,8 +646,14 @@ impl App {
             // --- preferences ---
             ui.collapsing("Preferences", |ui| {
                 ui.checkbox(
-                    &mut self.config.delete_session_on_exit,
-                    "End the hosted session when the front end closes",
+                    &mut self.config.use_tls,
+                    "Use TLS for the SGE login (recommended)",
+                )
+                .on_hover_text(
+                    "Encrypts the eaccess.play.net login. The certificate must be either \
+                     Simutronics' bundled certificate or one valid for a public CA. Turn off only \
+                     for a test server that doesn't speak TLS — the connection then sends the \
+                     password and key in the clear.",
                 );
                 ui.horizontal(|ui| {
                     ui.label("API base (advanced):");
@@ -757,6 +832,7 @@ impl eframe::App for App {
             Screen::Busy => self.ui_busy(ui),
             Screen::Launched => self.ui_launched(ui),
             Screen::Settings => self.ui_settings(ui),
+            Screen::TlsRetry => self.ui_tls_retry(ui),
         });
     }
 }

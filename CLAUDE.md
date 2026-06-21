@@ -42,8 +42,13 @@ the data path before editing any single one:
   emits `Event` and calls `ctx.request_repaint()` to wake the UI. `launch()` is the core sequence;
   `wait_for_runner()` polls `GET /api/sessions/{id}` until `ready` (bounded by `RUNNER_WAIT_MAX`).
 - `sge.rs` — Simutronics **SGE/EAccess** protocol, ported from Lich (`https://github.com/elanthia-online/lich-5`).
-  TLS to `eaccess.play.net:7910`; the cert is self-signed, accepted and **trust-on-first-use
-  pinned** under the data dir (like Lich). Handshake K→A→M→F→G→P→C→L. Password hash is
+  Connects to `eaccess.play.net:7910` via `SgeStream` (enum: TLS or plaintext). TLS is the default
+  (`Config.use_tls`). Cert acceptance: an accept-any handshake first checks the bundled
+  `assets/simu.pem` pin (`cert_matches_pin`, today's self-signed case, one handshake); if it doesn't
+  match, it re-handshakes with full system-CA + hostname verification (future-proofs a CA migration).
+  Anything else is refused — no encrypted-but-unverified mode. On a TLS failure the worker emits
+  `Event::TlsRetryOffer` and the UI offers a one-off **retry over plaintext** (re-issues with
+  `use_tls=false`). Handshake K→A→M→F→G→P→C→L. Password hash is
   `(((pw[i]-32) ^ hashkey[i]) + 32) & 0xff` over latin1 bytes — the highest-value test.
 - `mudmobile.rs` — HTTP API client (`ureq`). Bearer `wlk_` token. Maps HTTP status → typed
   `AppError` (401/402/409/400/502). `gamehost_allowed()` is an **anti-SSRF allowlist** — keep it

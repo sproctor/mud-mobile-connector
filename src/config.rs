@@ -66,7 +66,7 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         let back: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(cfg.frontends.len(), back.frontends.len());
-        assert!(back.delete_session_on_exit);
+        assert!(back.remember_password);
         // a front end with nested overrides survives the round trip
         let wiz = back.frontends.iter().find(|f| f.name == "Wizard").unwrap();
         assert_eq!(wiz.sal_overrides.game.as_deref(), Some("WIZ"));
